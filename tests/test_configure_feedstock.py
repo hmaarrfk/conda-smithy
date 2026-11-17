@@ -3647,3 +3647,56 @@ def test_vm_image_gha(py_recipe, jinja_env, override: bool, label: str | None):
     assert {
         "_".join(v["CONFIG"].split("_", 2)[:2]): v["runs_on"] for v in matrix
     } == expected
+
+
+class _FakeAzureResponse:
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"value": [{"id": 1234}]}
+
+
+def _azure_forge_config(build_id=None):
+    return {
+        "azure": {
+            "user_or_org": "conda-forge",
+            "project_name": "feedstock-builds",
+            "build_id": build_id,
+        },
+        "github": {"repo_name": "foo-feedstock"},
+    }
+
+
+def test_azure_build_id_prefetched(monkeypatch):
+    urls = []
+
+    def fake_get(url, timeout):
+        urls.append(url)
+        return _FakeAzureResponse()
+
+    monkeypatch.setattr(configure_feedstock.requests, "get", fake_get)
+    forge_config = _azure_forge_config()
+    configure_feedstock._prefetch_azure_build_definitions(forge_config)
+    configure_feedstock.azure_build_id_from_public(forge_config)
+    assert forge_config["azure"]["build_id"] == 1234
+    assert urls == [
+        "https://dev.azure.com/conda-forge/feedstock-builds/_apis/build/definitions?name=foo-feedstock"
+    ]
+
+    # a known build id is not requested
+    configure_feedstock._prefetch_azure_build_definitions(_azure_forge_config(1))
+    assert len(urls) == 1
+
+
+def test_azure_build_id_prefetch_error(monkeypatch):
+    def fake_get(url, timeout):
+        raise OSError("no network")
+
+    monkeypatch.setattr(configure_feedstock.requests, "get", fake_get)
+    forge_config = _azure_forge_config()
+    configure_feedstock._prefetch_azure_build_definitions(forge_config)
+    # the request's error is raised where the build id is read, as before
+    with pytest.raises(OSError, match="no network"):
+        configure_feedstock.azure_build_id_from_public(forge_config)
+    assert forge_config["azure"]["build_id"] is None

@@ -11,6 +11,7 @@ import sys
 import textwrap
 import time
 from collections import Counter, OrderedDict, namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import cache, lru_cache
@@ -1946,18 +1947,40 @@ def azure_build_id_from_token(forge_config):
     forge_config["azure"]["build_id"] = build_info["build_id"]
 
 
+def _azure_build_definitions_url(forge_config):
+    return "https://dev.azure.com/{org}/{project_name}/_apis/build/definitions?name={repo}".format(
+        org=forge_config["azure"]["user_or_org"],
+        project_name=forge_config["azure"]["project_name"],
+        repo=forge_config["github"]["repo_name"],
+    )
+
+
+# Requests for the Azure build definitions, started before the recipe is
+# rendered so the round trip overlaps with the rendering.
+_azure_build_definitions_requests = {}
+
+
+def _prefetch_azure_build_definitions(forge_config):
+    if forge_config["azure"].get("build_id") is not None:
+        return
+    url = _azure_build_definitions_url(forge_config)
+    if url not in _azure_build_definitions_requests:
+        executor = ThreadPoolExecutor(max_workers=1)
+        _azure_build_definitions_requests[url] = executor.submit(
+            requests.get, url, timeout=5
+        )
+        executor.shutdown(wait=False)
+
+
 def azure_build_id_from_public(forge_config):
     """Retrieve Azure `build_id` from a `forge_config`. This function only works
     when the Azure org is public.
     """
-    resp = requests.get(
-        "https://dev.azure.com/{org}/{project_name}/_apis/build/definitions?name={repo}".format(
-            org=forge_config["azure"]["user_or_org"],
-            project_name=forge_config["azure"]["project_name"],
-            repo=forge_config["github"]["repo_name"],
-        ),
-        timeout=5,
-    )
+    url = _azure_build_definitions_url(forge_config)
+    if (pending := _azure_build_definitions_requests.pop(url, None)) is not None:
+        resp = pending.result()
+    else:
+        resp = requests.get(url, timeout=5)
     resp.raise_for_status()
     build_def = resp.json()["value"][0]
     forge_config["azure"]["build_id"] = build_def["id"]
@@ -2987,6 +3010,7 @@ def main(
 
     config = _load_forge_config(forge_dir, exclusive_config_file, forge_yml)
     config["feedstock_name"] = config["github"]["repo_name"]
+    _prefetch_azure_build_definitions(config)
 
     env = make_jinja_env(forge_dir)
     logger.debug("env rendered")
